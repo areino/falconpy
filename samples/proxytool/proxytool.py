@@ -8,10 +8,11 @@ r"""ProxyTool - Update Falcon Sensor proxy configurations remotely.
                     /___/
 
  Use RTR API to change Falcon sensor proxy configuration across CID or host group
- FalconPy v1.0
+ FalconPy v1.3.4
 
  CHANGE LOG
 
+ 06/12/2023   v3.7    Check handle RTR command errors, check FalconPY version
  07/08/2023   v3.6    Add Linux support and handle API authentication errors
  16/08/2023   v3.5    Add sanity check when using CID as scope
  28/02/2023   v3.4    Add ability to disable/delete proxy config
@@ -21,17 +22,21 @@ r"""ProxyTool - Update Falcon Sensor proxy configurations remotely.
  23/10/2022   v3.0    Rewrote 2.0 for error handling, logging and fetching host IDs from API
 """
 
+version = "3.7"
+current_falconpy = "1.3.4"
+
+
 
 # Import dependencies
 import datetime
 from argparse import ArgumentParser, RawTextHelpFormatter
 
-version = "3.6"
-
 # Define logging function
 def log(msg):
     """Print the log message to the terminal."""
     print(datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S") + '  ' + str(msg))
+
+log(f"Starting execution of ProxyTool (version {version})")
 
 # Import SDK
 try:
@@ -42,7 +47,7 @@ try:
         RealTimeResponseAdmin,
         HostGroup,
         SensorDownload
-    )
+    ) 
 except ImportError as err:
     log(err)
     log("Python falconpy library is required.\n"
@@ -51,6 +56,19 @@ except ImportError as err:
     raise SystemExit("Python falconpy library is required.\n"
                      "Install with: python3 -m pip install crowdstrike-falconpy"
                      ) from err
+
+# Check FalconPY version
+import falconpy
+versionfalconpy = falconpy.__version__
+
+if versionfalconpy == current_falconpy:
+    log(f"Running falconpy version {versionfalconpy}. Good.")
+else:
+    log(f"Running outdated falconpy version {versionfalconpy}.\n"
+        "Update with: pip3 install crowdstrike-falconpy --upgrade")
+    raise SystemExit(f"Running outdated falconpy version {versionfalconpy}.\n"
+        "Update with: pip3 install crowdstrike-falconpy --upgrade")   
+
 
 # Process command line arguments
 parser = ArgumentParser(description=__doc__, formatter_class=RawTextHelpFormatter)
@@ -162,6 +180,33 @@ def fetch_hosts(platform_name):
     return(hosts_all)
 
 
+def rtr_error(response):
+    for task in response["body"]["combined"]["resources"]:
+        if len(response["body"]["combined"]["resources"][task]["errors"]) > 0:
+            for error in response["body"]["combined"]["resources"][task]["errors"]:
+                log(f"AID {response['body']['combined']['resources'][task]['aid']} -- ERROR: {error['message']}")
+
+
+def rtr_batch_init_session(rtr_object, hosts_ids, queue_offline=True):
+    response = rtr_object.batch_init_sessions(host_ids=hosts_ids, queue_offline=queue_offline)
+    return(response['body']['batch_id'])
+
+
+def rtr_batch_command(rtr_object, batch_id, base_command, command_string, runscript=False):
+        log(f"-- Command: {command_string}")
+        if runscript:
+            response = rtr_object.batch_admin_command(batch_id=batch_id,
+                                                        base_command="runscript",
+                                                        command_string=f"runscript -Raw=```{command_string}```")
+        else:
+            response = rtr_object.batch_active_responder_command(batch_id=batch_id,
+                                                        base_command=base_command,
+                                                        command_string=command_string)                                                                                                            )
+        if response["status_code"] != 201:
+            log(f"---- Command error: {response['status_code']}")
+            raise SystemExit(f"Command error: {response['status_code']}")    
+
+
 
 
 def rtr_linux(hosts_all):
@@ -169,40 +214,24 @@ def rtr_linux(hosts_all):
     falcon = RealTimeResponse(auth_object=auth, base_url=args.base_url)
     falcon_admin = RealTimeResponseAdmin(auth_object=auth, base_url=args.base_url)
 
-    # Get batch id
-    response = falcon.batch_init_sessions(host_ids=hosts_all, queue_offline=True)
-
-    batch_id = response['body']['batch_id']
-
-
+    # Initialize and get batch id
+    batch_id = rtr_batch_init_session(falcon, hosts_all, True)
     if batch_id:
         log(f"Initiated RTR batch with id {batch_id} for LINUX hosts")
     else:
         raise SystemExit("Unable to initiate RTR session with hosts.")
 
+
     if not args.proxy_disable:
         # Enable proxy
         # Configure proxy: sudo /opt/CrowdStrike/falconctl -s --aph=<proxy host> --app=<proxy port>
         command = f"/opt/CrowdStrike/falconctl -s --aph={args.proxy_hostname} --app={args.proxy_port}"
-        response = falcon_admin.batch_admin_command(batch_id=batch_id,
-                                                        base_command="runscript",
-                                                        command_string=f"runscript -Raw=```{command}```"
-                                                        )
-        if response["status_code"] == 201:
-            log(f"-- Command: {command}")
-        else:
-            raise SystemExit(f"Error, Response: {response['status_code']} - {response.text}")
+        rtr_batch_command(falcon_admin, batch_id, "runscript", command, True)
         
         # Enable proxy: sudo /opt/CrowdStrike/falconctl -s --apd=FALSE
         command = f"/opt/CrowdStrike/falconctl -s --apd=FALSE"
-        response = falcon_admin.batch_admin_command(batch_id=batch_id,
-                                                        base_command="runscript",
-                                                        command_string=f"runscript -Raw=```{command}```"
-                                                        )
-        if response["status_code"] == 201:
-            log(f"-- Command: {command}")
-        else:
-            raise SystemExit(f"Error, Response: {response['status_code']} - {response.text}")
+        rtr_batch_command(falcon_admin, batch_id, "runscript", command, True)
+        
 
     else:
         # Disable proxy
@@ -215,7 +244,8 @@ def rtr_linux(hosts_all):
         if response["status_code"] == 201:
             log(f"-- Command: {command}")
         else:
-            raise SystemExit(f"Error, Response: {response['status_code']} - {response.text}")
+            rtr_error(response)
+            raise SystemExit(f"Error, Response: {response['status_code']}")
         
 
     log("-- Finished launching RTR commands, please check progress in the RTR audit logs")
@@ -228,10 +258,8 @@ def rtr_windows(hosts_all):
     # Now that we have the host IDs, we create a batch RTR list of commands to execute it in all hosts
     falcon = RealTimeResponse(auth_object=auth, base_url=args.base_url)
 
-    # Get batch id
-    response = falcon.batch_init_sessions(host_ids=hosts_all, queue_offline=True)
-    batch_id = response['body']['batch_id']
-
+    # Initialize and get batch id
+    batch_id = rtr_batch_init_session(falcon, hosts_all, True)
     if batch_id:
         log(f"Initiated RTR batch with id {batch_id} for WINDOWS hosts")
     else:
@@ -259,7 +287,9 @@ def rtr_windows(hosts_all):
                 if response["status_code"] == 201:
                     log(f"-- Issuing registry deletion for {key} in {store}")
                 else:
-                    raise SystemExit(f"Error, Response: {response['status_code']} - {response.text}")
+                    rtr_error(response)
+                    raise SystemExit(f"Error, Response: {response['status_code']}")
+                
             cmd_string = f"reg set {store} CsProxyHostname -ValueType=REG_SZ -Value={args.proxy_hostname}"
             response = falcon.batch_active_responder_command(batch_id=batch_id,
                                                              base_command="reg set",
@@ -268,8 +298,9 @@ def rtr_windows(hosts_all):
             if response["status_code"] == 201:
                 log(f"-- Issuing registry setting of CsProxyHostname to {args.proxy_hostname} in {store}")
             else:
-                raise SystemExit(f"Error, Response: {response['status_code']} - {response.text}")
-
+                    rtr_error(response)
+                    raise SystemExit(f"Error, Response: {response['status_code']}")
+            
             cmd_string = f"reg set {store} CsProxyport -ValueType=REG_DWORD -Value={args.proxy_port}"
             response = falcon.batch_active_responder_command(batch_id=batch_id,
                                                              base_command="reg set",
@@ -278,7 +309,9 @@ def rtr_windows(hosts_all):
             if response["status_code"] == 201:
                 log(f"-- Issuing registry setting of CsProxyport to {args.proxy_port} in {store}")
             else:
-                raise SystemExit(f"Error, Response: {response['status_code']} - {response.text}")
+                    rtr_error(response)
+                    raise SystemExit(f"Error, Response: {response['status_code']}")
+            
     else:
         # Deleting and disabling proxy config
         # Delete PAC, PN, PP, CsProxyHostname, CsProxyport in both locations. Set DisableProxy with a non-zero value
@@ -294,7 +327,9 @@ def rtr_windows(hosts_all):
                 if response["status_code"] == 201:
                     log(f"-- Issuing registry deletion for {key} in {store}")
                 else:
-                    raise SystemExit(f"Error, Response: {response['status_code']} - {response.text}")
+                    rtr_error(response)
+                    raise SystemExit(f"Error, Response: {response['status_code']}")
+                
             cmd_string = f"reg set {store} DisableProxy -ValueType=REG_DWORD -Value=1"
             response = falcon.batch_active_responder_command(batch_id=batch_id,
                                                              base_command="reg set",
@@ -303,7 +338,8 @@ def rtr_windows(hosts_all):
             if response["status_code"] == 201:
                 log(f"-- Issuing registry setting of DisableProxy to a non-zero value in {store}")
             else:
-                raise SystemExit(f"Error, Response: {response['status_code']} - {response.text}")
+                    rtr_error(response)
+                    raise SystemExit(f"Error, Response: {response['status_code']}")
 
     log("-- Finished launching RTR commands, please check progress in the RTR audit logs")
 
@@ -316,8 +352,6 @@ def rtr_windows(hosts_all):
 def main():  # pylint: disable=R0912,R0915,C0116
 
     global auth
-
-    log(f"Starting execution of ProxyTool (version {version})")
 
     log("Authenticating to API")
     auth = OAuth2(client_id=args.falcon_client_id,
